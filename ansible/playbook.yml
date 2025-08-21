@@ -1,0 +1,190 @@
+---
+- name: Stage config with placeholders; finalize on target with KV secrets
+  hosts: app
+  become: true
+  vars:
+    stack_root: /opt/stack
+    domain: "hyltest.openhost.name"
+    keyvault_name: "kcdemo-hyltest"
+    certbot_email: "iapply2025@gmail.com"
+
+  pre_tasks:
+    - name: Ensure prereqs
+      ansible.builtin.package:
+        name:
+          - dnf-plugins-core
+          - epel-release
+          - firewalld
+          - gettext
+          - jq
+          - nginx
+          - certbot
+        state: present
+
+    - name: Ensure firewalld is running
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Open HTTP/HTTPS
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop: [ "80/tcp", "443/tcp" ]
+
+    - name: Install Azure CLI repo
+      ansible.builtin.shell: |
+        set -e
+        rpm -q azure-cli >/dev/null 2>&1 && exit 0
+        rpm --import https://packages.microsoft.com/keys/microsoft.asc
+        cat >/etc/yum.repos.d/azure-cli.repo <<'EOF'
+        [azure-cli]
+        name=Azure CLI
+        baseurl=https://packages.microsoft.com/yumrepos/azure-cli
+        enabled=1
+        gpgcheck=1
+        gpgkey=https://packages.microsoft.com/keys/microsoft.asc
+        EOF
+        dnf -y install azure-cli
+      args: { executable: /bin/bash }
+      changed_when: false
+
+  tasks:
+    - name: Create dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ stack_root }}"
+        - "{{ stack_root }}/web/html"
+        - "{{ stack_root }}/keycloak"
+        - /usr/local/bin
+        - /var/www/certbot
+
+    - name: Deploy host nginx (port 80) for ACME + redirect
+      ansible.builtin.copy:
+        src: files/nginx-host.conf
+        dest: /etc/nginx/conf.d/letsencrypt.conf
+        mode: "0644"
+
+    - name: Enable and start host nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Obtain/renew certificate (webroot)
+      ansible.builtin.command:
+        cmd: >
+          certbot certonly --webroot
+          -w /var/www/certbot
+          -d {{ domain }}
+          --email {{ certbot_email }}
+          --agree-tos --no-eff-email --keep-until-expiring
+      args:
+        creates: "/etc/letsencrypt/live/{{ domain }}/fullchain.pem"
+
+    - name: Install certbot renew systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certbot-renew.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Certbot renew
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/certbot renew --quiet --deploy-hook '/usr/bin/docker compose -f {{ stack_root }}/docker-compose.yml exec -T web nginx -s reload || true'
+
+    - name: Install certbot renew timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certbot-renew.timer
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Twice daily certbot renew
+
+          [Timer]
+          OnCalendar=*-*-* 03,15:00:00
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable and start certbot renew timer
+      ansible.builtin.systemd:
+        name: certbot-renew.timer
+        state: started
+        enabled: true
+
+    - name: Add Docker CE repo
+      ansible.builtin.yum_repository:
+        name: docker-ce-stable
+        description: Docker CE RHEL
+        baseurl: "https://download.docker.com/linux/rhel/docker-ce.repo"
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/rhel/gpg
+
+    - name: Install Docker engine and plugins
+      ansible.builtin.package:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Enable and start Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Copy docker-compose template
+      ansible.builtin.copy:
+        src: files/docker-compose.yml.tpl
+        dest: "{{ stack_root }}/docker-compose.yml.tpl"
+        mode: "0644"
+
+    - name: Copy nginx.conf template
+      ansible.builtin.copy:
+        src: files/nginx.conf.tpl
+        dest: "{{ stack_root }}/web/nginx.conf.tpl"
+        mode: "0644"
+
+    - name: Copy index.html
+      ansible.builtin.copy:
+        dest: "{{ stack_root }}/web/html/index.html"
+        mode: "0644"
+        content: |
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>Test</title>
+          <h1>Test</h1>
+          <p>This is a test page.</p>
+
+    - name: Copy Keycloak realm template
+      ansible.builtin.copy:
+        src: files/demo-realm.json.tpl
+        dest: "{{ stack_root }}/keycloak/demo-realm.json.tpl"
+        mode: "0644"
+
+    - name: Install finalize helper on target
+      ansible.builtin.copy:
+        src: files/app_finalize.sh
+        dest: /usr/local/bin/app_finalize.sh
+        mode: "0755"
+
+    - name: Run finalize helper
+      ansible.builtin.shell: /usr/local/bin/app_finalize.sh
+      args: { executable: /bin/bash }
+      environment:
+        STACK_ROOT: "{{ stack_root }}"
+        DOMAIN: "{{ domain }}"
+        KV_NAME: "{{ keyvault_name }}"

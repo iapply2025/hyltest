@@ -1,0 +1,95 @@
+name: provision
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_DIR: ./terraform
+  ANSIBLE_DIR: ./ansible
+  TFSTATE_RG: ${{ vars.TFSTATE_RG }}
+  TFSTATE_SA: ${{ vars.TFSTATE_SA }}
+  TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+  TFSTATE_KEY: ${{ vars.TFSTATE_KEY }}
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init (remote backend)
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${TFSTATE_RG}" \
+            -backend-config="storage_account_name=${TFSTATE_SA}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=${TFSTATE_KEY}"
+
+      - name: Read TF outputs (RG, control VM, app IP, admin user)
+        id: tfout
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq
+          terraform output -json > tf-outputs.json
+          echo "RG_NAME=$(jq -r '.resource_group.value' tf-outputs.json)" >> $GITHUB_ENV
+          echo "CTRL_NAME=$(jq -r '.control_vm_name.value' tf-outputs.json)" >> $GITHUB_ENV
+          echo "APP_PRIV_IP=$(jq -r '.app_private_ip.value' tf-outputs.json)" >> $GITHUB_ENV
+          echo "ADMIN_USER=$(jq -r '.admin_user.value' tf-outputs.json)" >> $GITHUB_ENV
+
+      - name: Prepare SSH key (base64 for safe transport)
+        run: |
+          echo "SSH_PRIV_KEY_B64=$(printf %s '${{ secrets.SSH_PRIVATE_KEY }}' | base64 -w0)" >> $GITHUB_ENV
+
+      - name: Prepare (optional) GH token for VM (base64, single-line)
+        run: |
+          if [ -n "${{ secrets.GH_READ_TOKEN }}" ]; then
+            echo "GH_TOKEN_B64=$(printf %s '${{ secrets.GH_READ_TOKEN }}' | base64 -w0)" >> $GITHUB_ENV
+          else
+            echo "GH_TOKEN_B64=" >> $GITHUB_ENV
+          fi
+
+      - name: Push repo to control VM
+        run: |
+          az vm run-command invoke \
+            -g "$RG_NAME" -n "$CTRL_NAME" \
+            --command-id RunShellScript \
+            --scripts @"scripts/push_repo_to_control.sh" \
+            --parameters \
+              "${{ github.repository }}" \
+              "${{ github.ref_name }}" \
+              "${GH_TOKEN_B64}"
+
+      - name: Run Ansible on control VM (targets app private IP)
+        run: |
+          az vm run-command invoke \
+            -g "$RG_NAME" -n "$CTRL_NAME" \
+            --command-id RunShellScript \
+            --scripts @"scripts/run_ansible_on_control.sh" \
+            --parameters \
+              "ADMIN_USER=${ADMIN_USER}" \
+              "APP_PRIV_IP=${APP_PRIV_IP}" \
+              "SSH_PRIV_KEY_B64=${SSH_PRIV_KEY_B64}"
