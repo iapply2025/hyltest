@@ -25,6 +25,7 @@ NSGs were set up such that only the control VM can access the app VM via SSH, an
 ## Caveats:
 - The Ansible inventory is "dynamically hardcoded" to the one IP (taken from Terraform) for the purpose of simplicity of this PoC.
 - The domain name is registered externally.
+- The GitHub workflows are triggered manually for ease of testing, in a real environment there would be a case for running them on PR close, or even on push, depending on how protected we want the branches.
 
 ## Possible improvements:
 - The domain name could be registered on Azure.
